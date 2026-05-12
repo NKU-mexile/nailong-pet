@@ -11,6 +11,11 @@ find_package(SFML 3 COMPONENTS Graphics REQUIRED)
 
 add_executable(nailong-pet src/main.cpp)
 
+# 告知 MSVC 源文件编码为 UTF-8，避免中文注释触发 C4819 警告
+if(MSVC)
+    target_compile_options(nailong-pet PRIVATE /utf-8)
+endif()
+
 target_link_libraries(nailong-pet PRIVATE
     SFML::Graphics
 )
