@@ -229,8 +229,14 @@ struct Physics {
             squish.trigger(true, now);
         }
 
-        // 全局速度兜底：合速度低于 1 像素/帧时彻底归零，防止长尾漂移
-        if (std::hypot(vel.x, vel.y) < 1.f) { vel.x = 0.f; vel.y = 0.f; }
+        // 全局速度兜底：合速度低于 1 像素/帧时归零，但必须同时贴近底部边缘才允许停止。
+        // 若奶龙还在空中（距底部超过5像素），即使速度很低也不归零，让重力继续把它拉下来，
+        // 避免向上甩动到顶点时因速度瞬间过零而误判停止、悬停在空中。
+        bool nearBottom = (pos.y >= sh - WIN_SIZE - 5);
+        if (std::hypot(vel.x, vel.y) < 1.f && nearBottom) {
+            vel.x = 0.f;
+            vel.y = 0.f;
+        }
 
         // 应用新位置
         window.setPosition(pos);
@@ -340,13 +346,13 @@ int main()
                     // 将窗口移动到"当前鼠标位置 - 初始偏移"，实现平滑跟手
                     window.setPosition(cur - dragOff);
 
-                    // 记录当前位置和时间到速度历史，同时淘汰100ms以前的旧数据
-                    // 只保留最近100ms，确保计算的是"松手前瞬间"的速度
+                    // 记录当前位置和时间，保留最近 200ms 的轨迹
+                    // 200ms 分两段：早段(200~100ms)用于判断加速趋势，晚段(100~0ms)用于计算初速度
                     posHistory.push_back({cur, now});
                     while (posHistory.size() > 1) {
                         float age = std::chrono::duration_cast<Fsec>(
                                         now - posHistory.front().t).count();
-                        if (age > 0.10f) posHistory.pop_front(); // 淘汰100ms前的记录
+                        if (age > 0.20f) posHistory.pop_front(); // 淘汰 200ms 前的记录
                         else             break;
                     }
                 }
@@ -358,29 +364,77 @@ int main()
                     bool wasClick = dragging && !dragged;
                     dragging = false;
 
-                    // ---- 甩动判定 ----
-                    // 条件：本次是拖动（dragged=true），且速度历史有足够数据
+                    // ---- 甩动判定（速度趋势方案）----
+                    // 核心思想：将拖动轨迹分为"早段"(200~100ms前)和"晚段"(100ms~松手)两段，
+                    // 比较两段的平均速度大小，判断用户是在加速甩出还是减速放置。
+                    // 加速甩出时，对速度要求低；减速放置时，要求很高速才触发（几乎不触发）。
                     if (dragged && posHistory.size() >= 2) {
-                        auto& first = posHistory.front();
-                        auto& last  = posHistory.back();
-                        // 计算速度历史的时间跨度（秒）
-                        float dt = std::chrono::duration_cast<Fsec>(
-                                       last.t - first.t).count();
-                        // 计算从按下点到松开点的总位移（像素）
+                        auto& last    = posHistory.back();
+                        TP    refTime = last.t; // 以最后一条记录的时间作为"松手时刻"基准
+
+                        // 总位移：从按下点到松开点的直线距离（像素）
                         float totalDisp = std::hypot(
                             (float)(last.pos.x - pressPos.x),
                             (float)(last.pos.y - pressPos.y));
-                        if (dt > 0.001f) {
-                            // 用时间差计算速度（像素/秒），避免帧率波动影响
-                            sf::Vector2f vPps = {
-                                (float)(last.pos.x - first.pos.x) / dt,
-                                (float)(last.pos.y - first.pos.y) / dt
-                            };
-                            // 同时满足"速度 > 400像素/秒"且"总位移 > 80像素"才触发甩动
-                            // 防止原地抖动或缓慢拖动被误判为甩动
-                            if (std::hypot(vPps.x, vPps.y) > 400.f && totalDisp > 80.f)
-                                phys.launch({vPps.x / 60.f, vPps.y / 60.f}); // 转换为像素/帧后启动飞行
+
+                        // 遍历历史，将各记录按时间归入早段或晚段
+                        // 早段：距离松手 100ms~200ms 的记录
+                        // 晚段：距离松手 0ms~100ms 的记录
+                        bool         hasEarly = false,      hasLate = false;
+                        sf::Vector2i earlyFirstPos = {},    earlyLastPos = {};
+                        sf::Vector2i lateFirstPos  = {},    lateLastPos  = {};
+                        TP           earlyFirstT   = {},    earlyLastT   = {};
+                        TP           lateFirstT    = {},    lateLastT    = {};
+
+                        for (const auto& ps : posHistory) {
+                            float age = std::chrono::duration_cast<Fsec>(
+                                            refTime - ps.t).count();
+                            if (age > 0.10f && age <= 0.20f) {
+                                // 早段：第一条记录作为起点，后续不断更新终点
+                                if (!hasEarly) { earlyFirstPos = ps.pos; earlyFirstT = ps.t; }
+                                earlyLastPos = ps.pos; earlyLastT = ps.t;
+                                hasEarly = true;
+                            } else if (age >= 0.f && age <= 0.10f) {
+                                // 晚段：同上
+                                if (!hasLate) { lateFirstPos = ps.pos; lateFirstT = ps.t; }
+                                lateLastPos = ps.pos; lateLastT = ps.t;
+                                hasLate = true;
+                            }
                         }
+
+                        // 计算晚段平均速度 velLate（像素/秒），用于甩动初速度
+                        sf::Vector2f velLate = {};
+                        float dtLate = std::chrono::duration_cast<Fsec>(
+                                           lateLastT - lateFirstT).count();
+                        if (hasLate && dtLate > 0.001f) {
+                            velLate = {
+                                (float)(lateLastPos.x - lateFirstPos.x) / dtLate,
+                                (float)(lateLastPos.y - lateFirstPos.y) / dtLate
+                            };
+                        }
+
+                        // 计算早段平均速度 velEarly（像素/秒），用于判断加速趋势
+                        sf::Vector2f velEarly = {};
+                        float dtEarly = std::chrono::duration_cast<Fsec>(
+                                            earlyLastT - earlyFirstT).count();
+                        if (hasEarly && dtEarly > 0.001f) {
+                            velEarly = {
+                                (float)(earlyLastPos.x - earlyFirstPos.x) / dtEarly,
+                                (float)(earlyLastPos.y - earlyFirstPos.y) / dtEarly
+                            };
+                        }
+
+                        float speedLate  = std::hypot(velLate.x,  velLate.y);
+                        float speedEarly = std::hypot(velEarly.x, velEarly.y);
+                        // trend > 0：晚段比早段快（加速趋势，典型甩动）
+                        // trend ≤ -100：晚段比早段慢很多（减速趋势，典型放置）
+                        float trend = speedLate - speedEarly;
+
+                        // 只有"松手前明确加速"才触发甩动，减速或匀速一律视为拖动放置
+                        // 条件：trend > 30（晚段比早段快30px/s以上）且 晚段速度本身 > 80px/s
+                        if (trend > 30.f && speedLate > 150.f && totalDisp > 80.f)
+                            // 用晚段速度作为初速度，从像素/秒换算为像素/帧（÷60）
+                            phys.launch({velLate.x / 60.f, velLate.y / 60.f});
                     }
                     posHistory.clear(); // 松开后清空历史，节省内存
 

@@ -1,0 +1,40 @@
+# CMake generation dependency list for this directory.
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeCXXInformation.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeCommonLanguageInclude.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeDependentOption.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeGenericSystem.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeInitializeConfigs.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeLanguageInformation.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeRCInformation.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeSystemSpecificInformation.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/CMakeSystemSpecificInitialize.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Compiler/CMakeCommonCompilerMacros.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Compiler/MSVC-CXX.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Compiler/MSVC.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Internal/CMakeCXXLinkerInformation.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Internal/CMakeCommonLinkerInformation.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Linker/MSVC-CXX.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Linker/MSVC.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Platform/Linker/Windows-MSVC-CXX.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Platform/Linker/Windows-MSVC.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Platform/Windows-Initialize.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Platform/Windows-MSVC-CXX.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Platform/Windows-MSVC.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Platform/Windows.cmake
+C:/Program Files/CMake/share/cmake-4.3/Modules/Platform/WindowsPaths.cmake
+C:/Users/12739/nailong-pet/CMakeLists.txt
+C:/Users/12739/nailong-pet/build/CMakeFiles/4.3.2/CMakeCXXCompiler.cmake
+C:/Users/12739/nailong-pet/build/CMakeFiles/4.3.2/CMakeRCCompiler.cmake
+C:/Users/12739/nailong-pet/build/CMakeFiles/4.3.2/CMakeSystem.cmake
+C:/vcpkg/installed/x64-windows/share/sfml/SFMLConfig.cmake
+C:/vcpkg/installed/x64-windows/share/sfml/SFMLConfigVersion.cmake
+C:/vcpkg/installed/x64-windows/share/sfml/SFMLGraphicsSharedTargets-debug.cmake
+C:/vcpkg/installed/x64-windows/share/sfml/SFMLGraphicsSharedTargets-release.cmake
+C:/vcpkg/installed/x64-windows/share/sfml/SFMLGraphicsSharedTargets.cmake
+C:/vcpkg/installed/x64-windows/share/sfml/SFMLSystemSharedTargets-debug.cmake
+C:/vcpkg/installed/x64-windows/share/sfml/SFMLSystemSharedTargets-release.cmake
+C:/vcpkg/installed/x64-windows/share/sfml/SFMLSystemSharedTargets.cmake
+C:/vcpkg/installed/x64-windows/share/sfml/SFMLWindowSharedTargets-debug.cmake
+C:/vcpkg/installed/x64-windows/share/sfml/SFMLWindowSharedTargets-release.cmake
+C:/vcpkg/installed/x64-windows/share/sfml/SFMLWindowSharedTargets.cmake
+C:/vcpkg/scripts/buildsystems/vcpkg.cmake
