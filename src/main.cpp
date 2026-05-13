@@ -6,11 +6,26 @@
 //   3. CPU/内存过载时触发"哭泣"状态
 //   4. 拖动窗口时显示"拖动"状态（紫色椭圆）
 //   5. 快速甩动后触发物理飞行 + 边缘弹跳挤压动画
+//   6. 连续使用60分钟后触发"疲惫"状态（灰色 + "Take a break!"气泡）
+//   7. 音效系统：点击/大笑时播放程序化正弦波音效，支持静音标志
+//   8. 右键菜单：关闭 / 最小化到托盘 / 固定 / 禁用点击动画 / 静音
+//   9. 打招呼气泡：启动和唤醒时显示问候、日期、陪伴时长、IP属地（20秒）
 // ============================================================
 
 #include <SFML/Graphics.hpp>
+#include <SFML/Audio.hpp>
 #include <windows.h>
+#include <shellapi.h>   // Shell_NotifyIcon（系统托盘）
+#include <winhttp.h>    // WinHttpOpen 等（IP 属地查询）
 #include <deque>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <sstream>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <ctime>
 #include <chrono>
 #include <cstdlib>
 #include <cmath>
@@ -26,10 +41,11 @@ using Fsec  = std::chrono::duration<float>; // 浮点秒，用于物理计算
 //   Normal  —— 默认橙色圆形
 //   Smile   —— 点击后变黄、微微变大
 //   Laugh   —— 快速点击5次后变红、明显变大
+//   Tired   —— 连续使用超过60分钟后变灰，并显示"Take a break!"气泡
 //   Cry     —— CPU或内存过载时变蓝、缩小
 //   Drag    —— 鼠标拖动时变紫色椭圆
 // ============================================================
-enum class State { Normal, Smile, Laugh, Cry, Drag };
+enum class State { Normal, Smile, Laugh, Tired, Cry, Drag };
 
 
 // ============================================================
@@ -249,6 +265,188 @@ struct Physics {
 
 
 // ============================================================
+// makeSineBuffer —— 程序化生成正弦波音效缓冲区
+// 不依赖外部音频文件，通过数学计算直接写入 PCM 样本。
+// freq:       音调频率（Hz），例如 660 = E5，880 = A5
+// duration:   时长（秒）
+// sampleRate: 采样率（默认 44100 Hz）
+// 末尾施加线性淡出包络，防止截断噪声（爆音）。
+// ============================================================
+sf::SoundBuffer makeSineBuffer(float freq, float duration, unsigned int sampleRate = 44100) {
+    auto numSamples = static_cast<std::size_t>(sampleRate * duration);
+    std::vector<std::int16_t> samples(numSamples);
+    for (std::size_t i = 0; i < numSamples; ++i) {
+        float t        = static_cast<float>(i) / static_cast<float>(sampleRate);
+        float envelope = 1.f - t / duration; // 线性淡出：开头最响，末尾归零
+        samples[i]     = static_cast<std::int16_t>(
+            envelope * std::sin(2.f * 3.14159265358979f * freq * t) * 28000.f);
+    }
+    sf::SoundBuffer buf;
+    (void)buf.loadFromSamples(samples.data(), samples.size(), 1, sampleRate,
+                              {sf::SoundChannel::Mono});
+    return buf;
+}
+
+
+// ============================================================
+// 托盘回调系统
+// Shell_NotifyIcon 把鼠标事件发给 nid.hWnd 指定的窗口。
+// 若直接用 SFML 的 hwnd，SFML 内部 PeekMessage(0,0,PM_REMOVE) 会
+// 在我们读到消息之前将其吞噬。
+// 解决方案：注册一个独立的隐藏消息专用窗口（HWND_MESSAGE），
+// 托盘消息只发往该窗口，完全脱离 SFML 消息泵。
+// ============================================================
+
+// ============================================================
+// 打招呼气泡 —— 程序启动和电脑唤醒时显示
+// ============================================================
+
+// ---- IP 属地查询（子线程执行，避免阻塞主线程）----
+static std::mutex        s_ipMutex;
+static std::string       s_ipLocation = "loading..."; // 初始占位，查询完成后替换
+static std::atomic<bool> s_ipReady{false};
+
+// UTF-8 字节串 → wstring（供 sf::String 直接使用）
+static std::wstring utf8ToWide(const std::string& u8) {
+    if (u8.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, u8.c_str(), -1, nullptr, 0);
+    if (n <= 0) return L"";
+    std::wstring w(static_cast<std::size_t>(n - 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, u8.c_str(), -1, &w[0], n);
+    return w;
+}
+
+// 通过 WinHTTP 向 ip-api.com 查询 IP 属地，结果写入 s_ipLocation（UTF-8）
+static void fetchIpLocation() {
+    auto setResult = [](const char* loc) {
+        std::lock_guard<std::mutex> lk(s_ipMutex);
+        s_ipLocation = loc;
+        s_ipReady    = true;
+    };
+
+    HINTERNET hSess = WinHttpOpen(L"NailongPet/1.0",
+                                   WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                   WINHTTP_NO_PROXY_NAME,
+                                   WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSess) { setResult("unknown"); return; }
+
+    HINTERNET hConn = WinHttpConnect(hSess, L"ip-api.com",
+                                      INTERNET_DEFAULT_HTTP_PORT, 0);
+    if (!hConn) { WinHttpCloseHandle(hSess); setResult("unknown"); return; }
+
+    HINTERNET hReq = WinHttpOpenRequest(
+        hConn, L"GET",
+        L"/json/?fields=regionName,city",   // 不加 lang=zh-CN，返回英文城市名
+        nullptr, WINHTTP_NO_REFERER,
+        WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!hReq) {
+        WinHttpCloseHandle(hConn); WinHttpCloseHandle(hSess);
+        setResult("unknown"); return;
+    }
+
+    bool ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                  WINHTTP_NO_REQUEST_DATA, 0, 0, 0)
+           && WinHttpReceiveResponse(hReq, nullptr);
+
+    std::string body;
+    if (ok) {
+        char buf[1024]; DWORD read = 0;
+        while (WinHttpReadData(hReq, buf, sizeof(buf) - 1, &read) && read > 0) {
+            buf[read] = '\0';
+            body += buf;
+        }
+    }
+    WinHttpCloseHandle(hReq);
+    WinHttpCloseHandle(hConn);
+    WinHttpCloseHandle(hSess);
+
+    // 手动解析 JSON 字段（避免引入第三方库）
+    auto extract = [&](const std::string& key) -> std::string {
+        std::string needle = "\"" + key + "\":\"";
+        auto pos = body.find(needle);
+        if (pos == std::string::npos) return {};
+        pos += needle.size();
+        auto end = body.find('"', pos);
+        return end == std::string::npos ? std::string{} : body.substr(pos, end - pos);
+    };
+    std::string region = extract("regionName");
+    std::string city   = extract("city");
+    if (region.empty() && city.empty())
+        setResult("unknown");
+    else
+        setResult((region + (city.empty() ? "" : ", " + city)).c_str());
+}
+
+// 根据当前小时返回英文问候语（6-12 早上，12-18 下午，其余晚上）
+static std::wstring getGreeting() {
+    time_t t = time(nullptr);
+    struct tm tm{}; localtime_s(&tm, &t);
+    int h = tm.tm_hour;
+    if (h >= 6  && h < 12) return L"Good morning!";
+    if (h >= 12 && h < 18) return L"Good afternoon!";
+    return                         L"Good evening!";
+}
+
+// 返回 "Today: YYYY/MM/DD Weekday"（全英文，避免字体缺字）
+static std::wstring getDateStr() {
+    time_t t = time(nullptr);
+    struct tm tm{}; localtime_s(&tm, &t);
+    const wchar_t* days[] = {L"Sun",L"Mon",L"Tue",L"Wed",
+                              L"Thu",L"Fri",L"Sat"};
+    wchar_t buf[64];
+    swprintf_s(buf, L"Today: %04d/%02d/%02d %ls",
+               tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+               days[tm.tm_wday]);
+    return buf;
+}
+
+// ---- 打招呼气泡 ----
+struct GreetBubble {
+    bool                      active        = false;
+    TP                        hideAt        = {};
+    std::vector<std::wstring> lines;           // 各行文字（wstring 供 sf::String 使用）
+    bool                      ipLineUpdated = false; // IP 行是否已替换为最终值
+
+    void show(std::vector<std::wstring> ls, TP now) {
+        lines         = std::move(ls);
+        hideAt        = now + std::chrono::seconds(20);
+        active        = true;
+        ipLineUpdated = false;
+    }
+
+    // 每帧调用：检查超时，并在 IP 查询完成后更新最后一行
+    void update(TP now) {
+        if (!active) return;
+        if (now >= hideAt) { active = false; return; }
+        if (!ipLineUpdated && s_ipReady.load()) {
+            std::lock_guard<std::mutex> lk(s_ipMutex);
+            if (lines.size() >= 4)
+                lines[3] = std::wstring(L"Location: ") + utf8ToWide(s_ipLocation);
+            ipLineUpdated = true;
+        }
+    }
+};
+
+// ---- 全局标志 ----
+// 托盘点击标志：由 TrayWndProc 写入，主循环读取后立即清零
+static bool g_restoreFromTray = false;
+// 电脑唤醒标志：由 TrayWndProc 的 WM_POWERBROADCAST 设置
+static bool g_powerResumed    = false;
+
+LRESULT CALLBACK TrayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_APP + 1) {
+        UINT ev = LOWORD(lp); // 低16位是实际鼠标事件（WM_LBUTTONUP / WM_LBUTTONDBLCLK 等）
+        if (ev == WM_LBUTTONUP || ev == WM_LBUTTONDBLCLK)
+            g_restoreFromTray = true;
+    } else if (msg == WM_POWERBROADCAST && wp == PBT_APMRESUMEAUTOMATIC) {
+        // 系统从睡眠/休眠中恢复唤醒，主循环检测此标志后显示打招呼气泡
+        g_powerResumed = true;
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+
+// ============================================================
 // main —— 程序入口
 // 负责：窗口初始化、事件循环、状态机、渲染
 // ============================================================
@@ -285,6 +483,33 @@ int main()
     SystemMonitor sysmon;
     Physics       phys;
 
+    // ---- 疲惫状态：连续使用60分钟后触发，程序重启才恢复 ----
+    // SFML 3 已移除内置字体，使用 Windows 系统自带的 Arial 字体（无需随程序分发）
+    sf::Font bubbleFont;
+    bool     fontLoaded = bubbleFont.openFromFile("C:/Windows/Fonts/arial.ttf");
+    TP       startTime  = Clock::now(); // 程序启动时间：供疲惫倒计时和陪伴时长两用
+    bool     tired      = false;        // 疲惫标志：一旦置 true 不再重置
+
+    // ---- 累计陪伴时长（跨 session 持久化到 nailong_time.txt）----
+    // 文件存储历史累计分钟数；退出时追加本次增量并写回
+    int64_t baseMinutes = 0;
+    {
+        std::ifstream fin("nailong_time.txt");
+        if (fin) fin >> baseMinutes;
+    }
+
+    // ---- 音效系统（程序化正弦波占位音效，不依赖外部文件）----
+    // 缓冲区必须在 sf::Sound 之前声明，且生命周期不短于对应 Sound 对象
+    sf::SoundBuffer smileBuffer = makeSineBuffer(660.f, 0.15f); // 微笑：E5，短促轻快
+    sf::SoundBuffer laughBuffer = makeSineBuffer(880.f, 0.30f); // 大笑：A5，稍长活泼
+    sf::Sound smileSound(smileBuffer);
+    sf::Sound laughSound(laughBuffer);
+    smileSound.setVolume(70.f);
+    laughSound.setVolume(70.f);
+    bool isMuted       = false; // 静音标志，默认开启；右键菜单切换
+    bool isPinned      = false; // 固定标志：true 时禁止拖动和甩动
+    bool laughDisabled = false; // 禁用点击动画：true 时点击不触发 Smile/Laugh
+
     // ---- 点击计数相关变量 ----
     std::deque<TP> clicks;          // 记录最近点击的时间戳，用于检测快速连击
     constexpr int  LAUGH_N  = 5;    // 触发大笑所需的连击次数
@@ -301,12 +526,116 @@ int main()
     struct PosStamp { sf::Vector2i pos; TP t; };
     std::deque<PosStamp> posHistory;
 
+    // ---- 系统托盘 ----
+    // 注册并创建独立的隐藏消息窗口（HWND_MESSAGE），专门接收托盘回调。
+    // 使用 HWND_MESSAGE 的好处：该窗口没有桌面呈现，不出现在 Alt+Tab，
+    // 且其消息队列完全独立于 SFML 窗口，PeekMessage 不会互相干扰。
+    WNDCLASSW trayClass{};
+    trayClass.lpfnWndProc   = TrayWndProc;
+    trayClass.hInstance     = GetModuleHandle(nullptr);
+    trayClass.lpszClassName = L"NailongTrayMsg";
+    RegisterClassW(&trayClass);
+    HWND trayWnd = CreateWindowW(
+        L"NailongTrayMsg", nullptr, 0,
+        0, 0, 0, 0,
+        HWND_MESSAGE,               // 消息专用窗口，不可见
+        nullptr, GetModuleHandle(nullptr), nullptr);
+
+    NOTIFYICONDATAW nid{};
+    nid.cbSize           = sizeof(nid);
+    nid.hWnd             = trayWnd;      // 托盘消息发往独立窗口，不经过 SFML
+    nid.uID              = 1;            // 本程序只有一个托盘图标，固定 ID=1
+    nid.uFlags           = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    nid.uCallbackMessage = WM_APP + 1;  // 鼠标操作托盘图标时发送到 trayWnd 的消息号
+    nid.hIcon            = LoadIcon(nullptr, IDI_APPLICATION); // 暂用系统默认图标
+    wcscpy_s(nid.szTip, L"奶龙桌面宠物");
+    bool trayAdded = false; // 托盘图标是否已添加（true 时窗口处于隐藏状态）
+
+    // ---- 注册系统休眠/唤醒通知（发往独立消息窗口 trayWnd）----
+    // RegisterSuspendResumeNotification 发送有针对性的 WM_POWERBROADCAST，
+    // 不是广播消息，HWND_MESSAGE 窗口可以正常接收。
+    HPOWERNOTIFY hPowerNotify = RegisterSuspendResumeNotification(
+        trayWnd, DEVICE_NOTIFY_WINDOW_HANDLE);
+
+    // ---- 启动 IP 属地查询子线程 ----
+    std::thread(fetchIpLocation).detach();
+
+    // ---- 打招呼气泡：程序启动时立即显示 ----
+    GreetBubble greet;
+    auto buildGreetLines = [&](TP t) -> std::vector<std::wstring> {
+        int64_t mins = baseMinutes + std::chrono::duration_cast<std::chrono::minutes>(
+                           t - startTime).count();
+        std::string ipSnap;
+        { std::lock_guard<std::mutex> lk(s_ipMutex); ipSnap = s_ipLocation; }
+        return {
+            getGreeting(),
+            getDateStr(),
+            std::wstring(L"Companion time: ") + std::to_wstring(mins) + L" mins",
+            std::wstring(L"Location: ") + utf8ToWide(ipSnap)
+        };
+    };
+    greet.show(buildGreetLines(Clock::now()), Clock::now());
+
     // ============================================================
     // 主循环：事件处理 → 状态更新 → 渲染，每帧执行一次
     // ============================================================
     while (window.isOpen()) {
         TP now = Clock::now(); // 记录本帧开始时间，供本帧所有逻辑统一使用
+
+        // ---- 托盘消息处理 ----
+        // 用 PeekMessage + DispatchMessage 驱动独立消息窗口（trayWnd）的消息队列，
+        // DispatchMessage 将消息路由给 TrayWndProc，后者写入 g_restoreFromTray。
+        // 此处理与 SFML 的 pollEvent 完全独立，不存在消息被 SFML 吞噬的问题。
+        {
+            MSG m;
+            while (PeekMessageW(&m, trayWnd, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&m);
+                DispatchMessageW(&m); // → TrayWndProc → 设置 g_restoreFromTray
+            }
+            if (g_restoreFromTray && trayAdded) {
+                g_restoreFromTray = false;
+                window.setVisible(true);
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                Shell_NotifyIconW(NIM_DELETE, &nid);
+                trayAdded = false;
+            }
+        }
+
         sysmon.sample();       // 尝试采样系统资源（内部节流，2秒最多一次）
+
+        // ---- 电脑唤醒检测 ----
+        // g_powerResumed 由 TrayWndProc 在收到 WM_POWERBROADCAST(PBT_APMRESUMEAUTOMATIC) 时设置
+        if (g_powerResumed) {
+            g_powerResumed = false;
+            // 若窗口已最小化到托盘，先恢复显示
+            if (trayAdded) {
+                window.setVisible(true);
+                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                Shell_NotifyIconW(NIM_DELETE, &nid);
+                trayAdded = false;
+            }
+            // 唤醒后重新查询 IP（可能已切换网络），重置查询状态
+            { std::lock_guard<std::mutex> lk(s_ipMutex); s_ipLocation = "loading..."; }
+            s_ipReady = false;
+            std::thread(fetchIpLocation).detach();
+            // 显示唤醒打招呼气泡
+            greet.show(buildGreetLines(now), now);
+        }
+
+        greet.update(now); // 更新气泡：检查超时，IP 查询完成后刷新最后一行
+
+        // 连续使用时长超过60分钟则永久进入疲惫状态（只设不清）
+        if (!tired) {
+            auto usedMs = std::chrono::duration_cast<Ms>(now - startTime).count();
+            if (usedMs >= 60LL * 60 * 1000)
+                tired = true;
+        }
+
+        // 计算本帧的"基础状态"：飞行/拖动/点击等高优先级状态结束后的默认回落目标
+        // 优先级：疲惫 > CPU/内存过载（哭泣）> 正常
+        State baseState = tired            ? State::Tired :
+                          sysmon.isBusy()  ? State::Cry   :
+                                             State::Normal;
 
         // ---- 事件处理 ----
         while (auto ev = window.pollEvent()) {
@@ -330,14 +659,13 @@ int main()
                     posHistory.clear();         // 清空速度历史，准备记录新的轨迹
                     pressPos = sf::Mouse::getPosition();          // 记录按下时的屏幕坐标
                     dragOff  = pressPos - window.getPosition();   // 计算鼠标与窗口原点的偏移
-                } else if (e->button == sf::Mouse::Button::Right) {
-                    // 右键按下：直接退出程序
-                    window.close();
-                }
+                }  // end Left button
 
             // 鼠标移动事件
             } else if (ev->is<sf::Event::MouseMoved>()) {
-                if (dragging) {
+                // isPinned 时跳过整个拖动逻辑：窗口不移动，dragged 不置 true，
+                // 这样 wasClick 仍能正确判定为点击，Smile/Laugh 不受影响
+                if (dragging && !isPinned) {
                     sf::Vector2i cur = sf::Mouse::getPosition(); // 当前鼠标屏幕坐标
                     auto d = cur - pressPos;
                     // 位移超过5像素才判定为拖动（避免手抖被误判）
@@ -368,7 +696,7 @@ int main()
                     // 核心思想：将拖动轨迹分为"早段"(200~100ms前)和"晚段"(100ms~松手)两段，
                     // 比较两段的平均速度大小，判断用户是在加速甩出还是减速放置。
                     // 加速甩出时，对速度要求低；减速放置时，要求很高速才触发（几乎不触发）。
-                    if (dragged && posHistory.size() >= 2) {
+                    if (!isPinned && dragged && posHistory.size() >= 2) {
                         auto& last    = posHistory.back();
                         TP    refTime = last.t; // 以最后一条记录的时间作为"松手时刻"基准
 
@@ -439,8 +767,8 @@ int main()
                     posHistory.clear(); // 松开后清空历史，节省内存
 
                     // ---- 点击计数逻辑（仅在判定为点击时执行）----
-                    // 处于大笑状态时忽略点击，不打断大笑动画
-                    if (wasClick && state != State::Laugh) {
+                    // 处于大笑状态、或 laughDisabled 时忽略点击
+                    if (wasClick && state != State::Laugh && !laughDisabled) {
                         clicks.push_back(now); // 记录本次点击时间
 
                         // 淘汰1.5秒以前的旧点击记录（超出连击时间窗口）
@@ -456,11 +784,98 @@ int main()
                             state    = State::Laugh;
                             stateEnd = now + Ms(2000);
                             clicks.clear(); // 清空计数，下一轮重新累计
+                            if (!isMuted) laughSound.play();
                         } else {
                             // 普通点击 → 触发微笑状态，持续1秒
                             state    = State::Smile;
                             stateEnd = now + Ms(1000);
+                            if (!isMuted) smileSound.play();
                         }
+                    }
+
+                } else if (e->button == sf::Mouse::Button::Right) {
+                    // ---- 右键松开：弹出原生右键菜单 ----
+                    // 菜单项文字根据当前状态动态切换
+                    // 构建顶部信息字符串（整数取整，%% 输出字面量 %）
+                    wchar_t sysInfo[64];
+                    swprintf_s(sysInfo, L"CPU: %d%%  内存: %d%%",
+                               static_cast<int>(sysmon.cpuUsage),
+                               static_cast<int>(sysmon.memUsage));
+
+                    HMENU menu = CreatePopupMenu();
+                    // 信息项：纯展示，MF_GRAYED 使其变灰且不可点击
+                    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, sysInfo);
+
+                    // 陪伴时长信息项
+                    wchar_t companionInfo[64];
+                    int64_t menuMins = baseMinutes +
+                        std::chrono::duration_cast<std::chrono::minutes>(
+                            now - startTime).count();
+                    swprintf_s(companionInfo, L"奶龙已陪伴你 %lld 分钟",
+                               static_cast<long long>(menuMins));
+                    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, companionInfo);
+
+                    // IP属地信息项
+                    wchar_t ipInfo[256];
+                    if (!s_ipReady.load()) {
+                        wcscpy_s(ipInfo, L"IP属地：查询中...");
+                    } else {
+                        std::lock_guard<std::mutex> lk(s_ipMutex);
+                        if (s_ipLocation == "unknown")
+                            wcscpy_s(ipInfo, L"IP属地：未知");
+                        else
+                            swprintf_s(ipInfo, L"IP属地：%ls",
+                                       utf8ToWide(s_ipLocation).c_str());
+                    }
+                    AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, ipInfo);
+
+                    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                    AppendMenuW(menu, MF_STRING,    1, L"关闭");
+                    AppendMenuW(menu, MF_STRING,    2, L"最小化到托盘");
+                    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                    AppendMenuW(menu, MF_STRING,    3,
+                        isPinned      ? L"取消固定"       : L"固定");
+                    AppendMenuW(menu, MF_STRING,    4,
+                        laughDisabled ? L"取消禁用Laughing" : L"禁用Laughing");
+                    AppendMenuW(menu, MF_STRING,    5,
+                        isMuted       ? L"取消静音"       : L"静音");
+                    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                    AppendMenuW(menu, MF_STRING,    6, L"刷新至正常状态");
+
+                    POINT pt;
+                    GetCursorPos(&pt);
+                    // SetForegroundWindow 是 TrackPopupMenu 正确消失的前置条件：
+                    // 只有前台窗口的菜单才会在点击外部时自动关闭
+                    SetForegroundWindow(hwnd);
+                    int cmd = TrackPopupMenu(menu,
+                                            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                            pt.x, pt.y, 0, hwnd, nullptr);
+                    DestroyMenu(menu);
+                    // TrackPopupMenu 标准收尾：发一条 WM_NULL 刷新消息队列
+                    PostMessage(hwnd, WM_NULL, 0, 0);
+
+                    switch (cmd) {
+                    case 1: // 关闭
+                        window.close();
+                        break;
+                    case 2: // 最小化到托盘：隐藏 SFML 窗口并添加托盘图标
+                        if (!trayAdded) {
+                            Shell_NotifyIconW(NIM_ADD, &nid);
+                            trayAdded = true;
+                        }
+                        window.setVisible(false);
+                        break;
+                    case 3: isPinned      = !isPinned;      break;
+                    case 4: laughDisabled = !laughDisabled; break;
+                    case 5: isMuted       = !isMuted;       break;
+                    case 6: // 刷新至正常状态：重置所有临时状态，不影响开关类设置
+                        state      = State::Normal;
+                        stateEnd   = {};          // 清除 Smile/Laugh 计时
+                        tired      = false;       // 解除疲惫标志
+                        startTime  = now;         // 重置疲惫倒计时起点
+                        clicks.clear();           // 清空连击计数
+                        greet.active = false;     // 关闭打招呼气泡
+                        break;
                     }
                 }
             }
@@ -468,7 +883,8 @@ int main()
 
         // ============================================================
         // 状态优先级判定（从高到低）：
-        //   飞行/弹跳 > 拖动 > 点击(微笑/大笑) > 哭泣 > 正常
+        //   飞行/弹跳 > 拖动 > 点击(微笑/大笑) > 疲惫 > 哭泣 > 正常
+        // 各高优先级状态结束后统一回落到 baseState（由疲惫/CPU负载决定）
         // ============================================================
 
         if (phys.active) {
@@ -476,24 +892,24 @@ int main()
             phys.update(window, now);
             // 物理本帧刚停止：立即在同帧内完成状态转换，避免渲染阶段读到过时的旧状态而闪烁
             if (!phys.active)
-                state = sysmon.isBusy() ? State::Cry : State::Normal;
+                state = baseState;
 
         } else if (dragging && dragged) {
             // 拖动状态：鼠标按住且发生了有效位移
             state = State::Drag;
 
         } else if (state == State::Drag) {
-            // 拖动刚结束（松开鼠标且本次是拖动）：根据当前系统负载决定回到哪个状态
-            state = sysmon.isBusy() ? State::Cry : State::Normal;
+            // 拖动刚结束：回落到 baseState（可能是 Tired / Cry / Normal）
+            state = baseState;
 
         } else if (state == State::Smile || state == State::Laugh) {
-            // 点击状态计时到期：根据当前 CPU/内存情况决定回到哭泣还是正常
+            // 点击状态计时到期：回落到 baseState
             if (now >= stateEnd)
-                state = sysmon.isBusy() ? State::Cry : State::Normal;
+                state = baseState;
 
         } else {
-            // 默认情况：实时跟随系统负载（每2秒更新一次，由 sysmon.isBusy() 决定）
-            state = sysmon.isBusy() ? State::Cry : State::Normal;
+            // 默认情况：始终跟随 baseState（疲惫/CPU负载实时更新）
+            state = baseState;
         }
 
         // ============================================================
@@ -522,6 +938,33 @@ int main()
             ellipse.setPosition({150.f - rx, 150.f - ry}); // 居中
             window.draw(ellipse);
 
+        } else if (state == State::Tired) {
+            // 疲惫状态：灰色圆形（略微缩小）+ 右上方"Take a break!"文字气泡
+            constexpr float r = 65.f;
+            sf::CircleShape circle(r);
+            circle.setFillColor(sf::Color(160, 160, 160));  // 灰色
+            circle.setPosition({150.f - r, 150.f - r});     // 居中
+            window.draw(circle);
+
+            // 气泡背景：白色矩形 + 灰色边框，位于奶龙右上方
+            sf::RectangleShape bubble({130.f, 38.f});
+            bubble.setFillColor(sf::Color(255, 255, 255));
+            bubble.setOutlineColor(sf::Color(140, 140, 140));
+            bubble.setOutlineThickness(2.f);
+            bubble.setPosition({155.f, 8.f});
+            window.draw(bubble);
+
+            // 气泡文字（仅在字体加载成功时绘制，自动居中于气泡）
+            if (fontLoaded) {
+                sf::Text text(bubbleFont, "Take a break!", 14);
+                text.setFillColor(sf::Color(70, 70, 70)); // 深灰色
+                auto b = text.getLocalBounds();
+                text.setOrigin({b.position.x + b.size.x / 2.f,
+                                b.position.y + b.size.y / 2.f});
+                text.setPosition({155.f + 65.f, 8.f + 19.f}); // 气泡中心
+                window.draw(text);
+            }
+
         } else {
             // 普通状态：根据 state 枚举决定颜色和大小
             float     r = 80.f;
@@ -539,8 +982,47 @@ int main()
             window.draw(circle);
         }
 
+        // 打招呼气泡：最后绘制，叠加在宠物形象上方，20秒后自动消失
+        if (greet.active && fontLoaded) {
+            // 气泡尺寸：宽占满窗口，高按行数动态计算
+            constexpr float bx = 5.f, by = 3.f, bw = 290.f;
+            constexpr float lineH = 22.f; // 行间距，与字号 15 匹配
+            float bh = 10.f + static_cast<float>(greet.lines.size()) * lineH;
+
+            sf::RectangleShape bg({bw, bh});
+            bg.setFillColor(sf::Color(255, 255, 255));
+            bg.setOutlineColor(sf::Color(180, 180, 180));
+            bg.setOutlineThickness(1.5f);
+            bg.setPosition({bx, by});
+            window.draw(bg);
+
+            for (std::size_t i = 0; i < greet.lines.size(); ++i) {
+                sf::Text ln(bubbleFont, sf::String(greet.lines[i]), 15);
+                ln.setFillColor(sf::Color(40, 40, 40));
+                ln.setPosition({bx + 8.f,
+                                by + 5.f + static_cast<float>(i) * lineH});
+                window.draw(ln);
+            }
+        }
+
         window.display(); // 将缓冲区内容提交到屏幕
     }
+
+    // 退出时将本次运行时长累加并写回持久化文件
+    {
+        int64_t total = baseMinutes + std::chrono::duration_cast<std::chrono::minutes>(
+                            Clock::now() - startTime).count();
+        std::ofstream fout("nailong_time.txt");
+        if (fout) fout << total;
+    }
+
+    // 注销电源通知，清除托盘图标和消息窗口
+    if (hPowerNotify)
+        UnregisterSuspendResumeNotification(hPowerNotify);
+    if (trayAdded)
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+    DestroyWindow(trayWnd);
+    UnregisterClassW(L"NailongTrayMsg", GetModuleHandle(nullptr));
 
     return 0;
 }

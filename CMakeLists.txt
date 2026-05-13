@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # If SFML is not found automatically, point to your installation, e.g.:
 #   cmake -DSFML_DIR="C:/SFML-2.6.2/lib/cmake/SFML" ..
 #   cmake -DSFML_DIR="C:/vcpkg/installed/x64-windows/share/sfml" ..
-find_package(SFML 3 COMPONENTS Graphics REQUIRED)
+find_package(SFML 3 COMPONENTS Graphics Audio REQUIRED)
 
 add_executable(nailong-pet src/main.cpp)
 
@@ -18,6 +18,9 @@ endif()
 
 target_link_libraries(nailong-pet PRIVATE
     SFML::Graphics
+    SFML::Audio
+    Shell32     # Shell_NotifyIcon（系统托盘）
+    Winhttp     # WinHttpOpen 等（IP 属地查询）
 )
 
 # Copy SFML DLLs next to the executable (requires CMake >= 3.21)
