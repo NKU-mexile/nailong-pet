@@ -11,6 +11,13 @@ find_package(SFML 3 COMPONENTS Graphics Audio REQUIRED)
 
 add_executable(nailong-pet src/main.cpp)
 
+# 将子系统设为 Windows，运行时不弹出黑色控制台窗口；
+# mainCRTStartup 保持 main() 作为入口，无需改为 WinMain
+if(MSVC)
+    set_target_properties(nailong-pet PROPERTIES
+        LINK_FLAGS "/SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup")
+endif()
+
 # 告知 MSVC 源文件编码为 UTF-8，避免中文注释触发 C4819 警告
 if(MSVC)
     target_compile_options(nailong-pet PRIVATE /utf-8)
