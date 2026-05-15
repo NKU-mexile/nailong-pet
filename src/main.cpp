@@ -1,4 +1,4 @@
-// ============================================================
+﻿// ============================================================
 // nailong-pet —— 桌面宠物主程序
 // 功能概览：
 //   1. 透明无边框窗口，始终置顶
@@ -28,6 +28,7 @@
 #include <ctime>
 #include <chrono>
 #include <cstdlib>
+#include <cstdio>
 #include <cmath>
 
 // 时间工具别名，方便后续使用
@@ -42,10 +43,11 @@ using Fsec  = std::chrono::duration<float>; // 浮点秒，用于物理计算
 //   Smile   —— 点击后变黄、微微变大
 //   Laugh   —— 快速点击5次后变红、明显变大
 //   Tired   —— 连续使用超过60分钟后变灰，并显示"Take a break!"气泡
+//   PreCry  —— 系统刚超过负载阈值时的过渡状态，播放1秒后自动切换到 Cry
 //   Cry     —— CPU或内存过载时变蓝、缩小
 //   Drag    —— 鼠标拖动时变紫色椭圆
 // ============================================================
-enum class State { Normal, Smile, Laugh, Tired, Cry, Drag };
+enum class State { Normal, Smile, Laugh, Tired, PreCry, Cry, Drag };
 
 
 // ============================================================
@@ -126,46 +128,48 @@ struct Squish {
     Phase phase      = Phase::None;
     TP    phaseStart = {};     // 当前阶段开始的时间点
     bool  vertical   = false;  // true = 撞上下边缘，false = 撞左右边缘
+    float sqAmt      = 0.4f;  // 压缩量：压缩轴最大变化量（1.0 - sqAmt = 最小比例）
+    float exAmt      = 0.4f;  // 拉伸量：拉伸轴最大变化量（1.0 + exAmt = 最大比例）
 
     // 动画是否正在播放
     bool isActive() const { return phase != Phase::None; }
 
     // 触发一次挤压动画（由物理系统在检测到碰撞时调用）
-    // isVert：true 表示撞击上/下边缘，false 表示撞击左/右边缘
+    // isVert=true：撞上/下边缘，形变较强（压缩到0.6，拉伸到1.4）
+    // isVert=false：撞左/右边缘，形变较弱（压缩到0.8，拉伸到1.2），视觉上不那么剧烈
     void trigger(bool isVert, TP now) {
-        phase      = Phase::Compress; // 从压缩阶段开始
+        phase      = Phase::Compress;
         phaseStart = now;
         vertical   = isVert;
+        sqAmt      = isVert ? 0.4f : 0.2f; // 上下：强形变；左右：弱形变
+        exAmt      = isVert ? 0.4f : 0.2f;
     }
 
-    // 每帧调用，返回当前应施加给圆形的缩放系数 {scaleX, scaleY}
+    // 每帧调用，返回当前应施加给 Sprite 的缩放系数 {scaleX, scaleY}
     // 同时负责在阶段结束时自动推进到下一阶段
     sf::Vector2f getScale(TP now) {
         if (phase == Phase::None) return {1.f, 1.f}; // 无动画，正常比例
 
-        // 计算当前阶段已经过去的时间（秒）
         float elapsed = std::chrono::duration_cast<Fsec>(now - phaseStart).count();
-        float sq, ex; // sq = 压缩轴比例，ex = 拉伸轴比例
+        float sq, ex; // sq = 压缩轴当前比例，ex = 拉伸轴当前比例
 
         if (phase == Phase::Compress) {
             // 压缩阶段持续 0.10 秒，t 从 0 线性增长到 1
             float t = std::min(elapsed / 0.10f, 1.f);
-            sq = 1.f - 0.4f * t; // 压缩轴：1.0 → 0.6
-            ex = 1.f + 0.4f * t; // 拉伸轴：1.0 → 1.4
-            // 压缩阶段结束，切换到复原阶段
+            sq = 1.f - sqAmt * t; // 压缩轴：1.0 → (1.0 - sqAmt)
+            ex = 1.f + exAmt * t; // 拉伸轴：1.0 → (1.0 + exAmt)
             if (t >= 1.f) { phase = Phase::Restore; phaseStart = now; }
         } else {
             // 复原阶段持续 0.15 秒，t 从 0 线性增长到 1
             float t = std::min(elapsed / 0.15f, 1.f);
-            sq = 0.6f + 0.4f * t; // 压缩轴：0.6 → 1.0
-            ex = 1.4f - 0.4f * t; // 拉伸轴：1.4 → 1.0
-            // 复原完毕，结束动画
+            sq = (1.f - sqAmt) + sqAmt * t; // 压缩轴复原：(1-sqAmt) → 1.0
+            ex = (1.f + exAmt) - exAmt * t; // 拉伸轴复原：(1+exAmt) → 1.0
             if (t >= 1.f) { phase = Phase::None; return {1.f, 1.f}; }
         }
 
         // 根据碰撞方向决定哪个轴被压缩、哪个轴被拉伸
-        // 撞上/下边缘：Y 轴压缩（sq），X 轴拉伸（ex）→ 圆形变扁
-        // 撞左/右边缘：X 轴压缩（sq），Y 轴拉伸（ex）→ 圆形变窄
+        // 撞上/下边缘：Y 轴压缩（sq），X 轴拉伸（ex）→ 变扁
+        // 撞左/右边缘：X 轴压缩（sq），Y 轴拉伸（ex）→ 变窄
         return vertical ? sf::Vector2f{ex, sq} : sf::Vector2f{sq, ex};
     }
 };
@@ -189,7 +193,37 @@ struct Physics {
     static constexpr float AIR_DRAG   = 0.98f;  // 空气阻力衰减系数（每帧速度×0.98）
     static constexpr float BOUNCE_K   = 0.70f;  // 反弹能量保留比例（损耗30%）
     static constexpr float STOP_SPEED = 0.5f;   // 速度低于此值时停止运动（像素/帧）
-    static constexpr int   WIN_SIZE   = 300;    // 窗口尺寸（宽高均为300像素）
+    int winWidth  = 300; // 窗口宽度（像素），加载素材后更新
+    int winHeight = 300; // 窗口高度（像素），加载素材后更新
+
+    // idle_01.png 内容 bounding box（由 compute_body_bbox.py 生成，原始像素单位）
+    // 图片实际尺寸 518×718，内容区域相对于图片左上角的偏移及宽高
+    static constexpr int IDLE_IMG_W   = 518;
+    static constexpr int IDLE_IMG_H   = 718;
+    static constexpr int IDLE_BBOX_OX = 94;   // 内容左边距
+    static constexpr int IDLE_BBOX_OY = 30;   // 内容上边距
+    static constexpr int IDLE_BBOX_W  = 329;  // 内容宽度
+    static constexpr int IDLE_BBOX_H  = 657;  // 内容高度
+
+    // 碰撞检测用的身体矩形偏移（相对于窗口边缘，运行时由 setupBodyRect 计算）
+    // bodyOffL/T：窗口左/上边到身体左/上边的距离（像素）
+    // bodyOffR/B：身体右/下边到窗口右/下边的距离（像素）
+    int bodyOffL = 0, bodyOffT = 0, bodyOffR = 0, bodyOffB = 0;
+
+    // 根据 idle 动画的实际 displayScale 计算碰撞矩形偏移，素材加载后调用一次
+    void setupBodyRect(float scaleX, float scaleY) {
+        // Sprite 以纹理中心为原点居中于窗口，推算纹理左上角在窗口内的坐标
+        float texL = winWidth  / 2.f - IDLE_IMG_W / 2.f * scaleX;
+        float texT = winHeight / 2.f - IDLE_IMG_H / 2.f * scaleY;
+        float bL   = texL + IDLE_BBOX_OX * scaleX;
+        float bT   = texT + IDLE_BBOX_OY * scaleY;
+        float bR   = bL   + IDLE_BBOX_W  * scaleX;
+        float bB   = bT   + IDLE_BBOX_H  * scaleY;
+        bodyOffL = static_cast<int>(bL);
+        bodyOffT = static_cast<int>(bT);
+        bodyOffR = static_cast<int>(winWidth  - bR);
+        bodyOffB = static_cast<int>(winHeight - bB);
+    }
 
     // 以给定初速度启动飞行（速度单位：像素/帧）
     void launch(sf::Vector2f v) { vel = v; active = true; squish = {}; }
@@ -213,42 +247,40 @@ struct Physics {
         pos.x += static_cast<int>(vel.x);
         pos.y += static_cast<int>(vel.y);
 
-        // ---- 边缘碰撞检测：先 clamp 位置，再处理速度反弹 ----
-        // 必须先将位置限制在边界内，否则下一帧仍会检测到超界，导致反复反弹
+        // ---- 边缘碰撞检测：以奶龙身体矩形（而非窗口边框）为基准 ----
+        // bodyOffL/T/R/B 由 setupBodyRect 预算好，使反弹恰好发生在身体触边时。
+        // 必须先 clamp 位置再处理速度，否则下一帧仍超界导致反复反弹。
 
-        // 检测左边缘碰撞
-        if (pos.x < 0) {
-            pos.x = 0; // 强制对齐到左边缘
-            // 速度过小时直接归零（避免低速下无限振动），否则反弹并损耗能量
+        // 左边：身体左边 = pos.x + bodyOffL，触屏左 → pos.x = -bodyOffL
+        if (pos.x < -bodyOffL) {
+            pos.x = -bodyOffL;
             if (std::abs(vel.x) < 3.f) vel.x = 0.f;
-            else                        vel.x = std::abs(vel.x) * BOUNCE_K; // 反向取正值
-            squish.trigger(false, now); // 触发左右方向的挤压动画
-        } else if (pos.x > sw - WIN_SIZE) {
-            // 检测右边缘碰撞
-            pos.x = sw - WIN_SIZE; // 强制对齐到右边缘
+            else                        vel.x = std::abs(vel.x) * BOUNCE_K;
+            squish.trigger(false, now);
+        } else if (pos.x > sw - winWidth + bodyOffR) {
+            // 右边：身体右边 = pos.x + winWidth - bodyOffR，触屏右 → pos.x = sw - winWidth + bodyOffR
+            pos.x = sw - winWidth + bodyOffR;
             if (std::abs(vel.x) < 3.f) vel.x = 0.f;
-            else                        vel.x = -std::abs(vel.x) * BOUNCE_K; // 反向取负值
+            else                        vel.x = -std::abs(vel.x) * BOUNCE_K;
             squish.trigger(false, now);
         }
 
-        // 检测上边缘碰撞
-        if (pos.y < 0) {
-            pos.y = 0;
+        // 上边：身体上边 = pos.y + bodyOffT，触屏顶 → pos.y = -bodyOffT
+        if (pos.y < -bodyOffT) {
+            pos.y = -bodyOffT;
             if (std::abs(vel.y) < 3.f) vel.y = 0.f;
             else                        vel.y = std::abs(vel.y) * BOUNCE_K;
-            squish.trigger(true, now); // 触发上下方向的挤压动画
-        } else if (pos.y > sh - WIN_SIZE) {
-            // 检测下边缘碰撞（屏幕底部）
-            pos.y = sh - WIN_SIZE;
+            squish.trigger(true, now);
+        } else if (pos.y > sh - winHeight + bodyOffB) {
+            // 下边：身体下边 = pos.y + winHeight - bodyOffB，触屏底 → pos.y = sh - winHeight + bodyOffB
+            pos.y = sh - winHeight + bodyOffB;
             if (std::abs(vel.y) < 3.f) vel.y = 0.f;
             else                        vel.y = -std::abs(vel.y) * BOUNCE_K;
             squish.trigger(true, now);
         }
 
-        // 全局速度兜底：合速度低于 1 像素/帧时归零，但必须同时贴近底部边缘才允许停止。
-        // 若奶龙还在空中（距底部超过5像素），即使速度很低也不归零，让重力继续把它拉下来，
-        // 避免向上甩动到顶点时因速度瞬间过零而误判停止、悬停在空中。
-        bool nearBottom = (pos.y >= sh - WIN_SIZE - 5);
+        // 全局速度兜底：贴近屏幕底部且速度极低时停止，防止顶点悬停误判
+        bool nearBottom = (pos.y >= sh - winHeight + bodyOffB - 5);
         if (std::hypot(vel.x, vel.y) < 1.f && nearBottom) {
             vel.x = 0.f;
             vel.y = 0.f;
@@ -260,6 +292,86 @@ struct Physics {
         // 停止条件：速度完全为零 且 挤压动画已结束
         if (vel.x == 0.f && vel.y == 0.f && !squish.isActive())
             active = false;
+    }
+};
+
+
+// laugh 动画渲染宽度基准（像素）。
+// laugh 按 TARGET_W / laugh帧宽 等比缩放；idle 和 smile 的 X/Y 缩放分别对齐到
+// laugh 的渲染尺寸，确保三套动画在屏幕上呈现完全相同的视觉大小。
+constexpr float TARGET_W = 180.f;
+
+// ============================================================
+// Animation —— 帧动画播放器
+// 从磁盘加载一系列连续编号的 PNG 帧（prefix_01.png …），按固定帧率循环播放。
+// 加载失败时 loaded=false，调用方据此回退到占位图形，不会崩溃。
+// ============================================================
+struct Animation {
+    std::vector<sf::Texture> frames;        // 所有帧的纹理（按顺序存储）
+    std::size_t              frameIdx = 0;  // 当前显示帧的索引
+    float                    fps      = 12.f; // 播放帧率（帧/秒）
+    float                    elapsed  = 0.f;  // 当前帧内已累计的时间（秒）
+    bool                     loaded   = false;
+    bool                     loop     = true;    // true=循环播放，false=播完最后一帧停住
+    // X/Y 独立缩放系数，由外部以 laugh 为基准统一校准，
+    // 保证 idle/smile/laugh 三套动画渲染后像素尺寸完全一致。
+    sf::Vector2f             displayScale = {1.f, 1.f};
+
+    // 从 folder/prefix_01.png … prefix_NN.png 加载 count 帧
+    // 任意一帧加载失败则整组丢弃，返回 false
+    bool load(const std::string& folder, const std::string& prefix, int count) {
+        frames.clear();
+        frames.reserve(static_cast<std::size_t>(count));
+        for (int i = 1; i <= count; ++i) {
+            // 补零到两位，例如 1 → "01"
+            std::string num = std::to_string(i);
+            if (num.size() < 2) num = "0" + num;
+            std::string path = folder + "/" + prefix + "_" + num + ".png";
+            sf::Texture tex;
+            if (!tex.loadFromFile(path)) {
+                fprintf(stderr, "[Animation] 加载失败: %s\n", path.c_str());
+                frames.clear();
+                loaded = false;
+                return false;
+            }
+            frames.push_back(std::move(tex));
+        }
+        loaded   = !frames.empty();
+        frameIdx = 0;
+        elapsed  = 0.f;
+        return loaded;
+    }
+
+    // 重置到第一帧（状态切入时调用，使动画从头开始）
+    void reset() { frameIdx = 0; elapsed = 0.f; }
+
+    // 每帧调用：累加 deltaTime，按帧率推进帧索引
+    // loop=true 时循环，loop=false 时停在最后一帧
+    void update(float dt) {
+        if (!loaded || frames.empty()) return;
+        elapsed += dt;
+        float dur = 1.f / fps;
+        while (elapsed >= dur) {
+            elapsed -= dur;
+            if (frameIdx + 1 < frames.size())
+                ++frameIdx;
+            else if (loop)
+                frameIdx = 0;
+            // loop=false 且已到末帧：保持停在最后一帧，不重置
+        }
+    }
+
+    // 返回当前帧的 Sprite，以纹理中心为原点并居中于 winSize 所描述的窗口。
+    // 缩放使用 displayScale（由外部以 laugh 为基准校准），squish 为物理挤压附加系数。
+    sf::Sprite getCurrentSprite(sf::Vector2u winSize,
+                                sf::Vector2f squish = {1.f, 1.f}) const {
+        const sf::Texture& tex = frames[frameIdx];
+        sf::Sprite spr(tex);
+        auto ts = tex.getSize();
+        spr.setOrigin({ts.x / 2.f, ts.y / 2.f});
+        spr.setScale({squish.x * displayScale.x, squish.y * displayScale.y});
+        spr.setPosition({winSize.x / 2.f, winSize.y / 2.f});
+        return spr;
     }
 };
 
@@ -476,12 +588,67 @@ int main()
     SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
 
     // ---- 状态机变量 ----
-    State state    = State::Normal; // 当前桌宠状态，初始为正常状态
-    TP    stateEnd = {};            // 点击状态（Smile/Laugh）的到期时间点
+    State state       = State::Normal; // 当前桌宠状态，初始为正常状态
+    TP    stateEnd    = {};            // 点击状态（Smile/Laugh）的到期时间点
+    bool  prevBusy    = false;         // 上一帧的 isBusy() 结果，用于检测上升沿触发 PreCry
+    TP    preCryStart = {};            // PreCry 状态的开始时间点
 
     // 系统监控器和物理系统实例
     SystemMonitor sysmon;
     Physics       phys;
+
+    // ---- 帧动画：加载真实素材 ----
+    // 加载失败不崩溃，loaded=false 时渲染阶段回退到占位图形
+    Animation idleAnim, smileAnim, laughAnim, cryAnim;
+    idleAnim .load("assets/idle",  "idle",  58);
+    smileAnim.load("assets/smile", "smile",  9);
+    laughAnim.load("assets/laugh", "laugh", 68);
+    cryAnim  .load("assets/cry",   "cry",   39); // cry 动画：39帧，循环播放
+    smileAnim.loop = false; // smile 只播一遍，与状态持续时间（750ms）严格对齐
+    laughAnim.loop = false; // laugh 只播一遍，与状态持续时间（5667ms）严格对齐
+    // cryAnim.loop 默认 true，持续循环直至 CPU/内存负载降低
+
+    // 根据 idle 第一帧尺寸自适应窗口大小，并同步更新物理边界参数
+    if (idleAnim.loaded) {
+        auto sz = idleAnim.frames[0].getSize();
+        window.setSize(sz);
+        window.setView(sf::View(sf::FloatRect(
+            {0.f, 0.f},
+            {static_cast<float>(sz.x), static_cast<float>(sz.y)})));
+        phys.winWidth  = static_cast<int>(sz.x);
+        phys.winHeight = static_cast<int>(sz.y);
+        // 重新置顶，setSize 可能短暂打乱层叠顺序
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+
+        // 以 laugh 第一帧为基准，统一校准三套动画的 displayScale：
+        // laugh 按 TARGET_W 等比缩放（宽恒为 TARGET_W，高按原始宽高比）；
+        // idle 和 smile 的 X/Y 缩放分别对齐到 laugh 的渲染尺寸，使三者视觉大小完全一致。
+        if (laughAnim.loaded) {
+            auto lsz     = laughAnim.frames[0].getSize();
+            float lscale = TARGET_W / static_cast<float>(lsz.x);   // laugh 等比缩放系数
+            laughAnim.displayScale = {lscale, lscale};
+
+            // laugh 渲染后的实际像素尺寸（宽固定为 TARGET_W，高按宽高比）
+            float rendW = TARGET_W;
+            float rendH = lscale * static_cast<float>(lsz.y);
+
+            // idle 和 smile：X/Y 分别缩放，使渲染宽高与 laugh 完全对齐
+            auto alignToLaugh = [&](Animation& anim) {
+                if (!anim.loaded || anim.frames.empty()) return;
+                auto fsz = anim.frames[0].getSize();
+                anim.displayScale = {
+                    rendW / static_cast<float>(fsz.x),
+                    rendH / static_cast<float>(fsz.y)
+                };
+            };
+            alignToLaugh(idleAnim);
+            alignToLaugh(smileAnim);
+            alignToLaugh(cryAnim);
+
+            // displayScale 确定后，预算碰撞检测用的身体矩形偏移
+            phys.setupBodyRect(idleAnim.displayScale.x, idleAnim.displayScale.y);
+        }
+    }
 
     // ---- 疲惫状态：连续使用60分钟后触发，程序重启才恢复 ----
     // SFML 3 已移除内置字体，使用 Windows 系统自带的 Arial 字体（无需随程序分发）
@@ -489,6 +656,9 @@ int main()
     bool     fontLoaded = bubbleFont.openFromFile("C:/Windows/Fonts/arial.ttf");
     TP       startTime  = Clock::now(); // 程序启动时间：供疲惫倒计时和陪伴时长两用
     bool     tired      = false;        // 疲惫标志：一旦置 true 不再重置
+    // "刷新至正常状态"强制标志：持续30秒内跳过疲惫/CPU/内存检测，强制保持 Normal
+    bool     forceNormal      = false;
+    TP       forceNormalUntil = {};
 
     // ---- 累计陪伴时长（跨 session 持久化到 nailong_time.txt）----
     // 文件存储历史累计分钟数；退出时追加本次增量并写回
@@ -498,14 +668,32 @@ int main()
         if (fin) fin >> baseMinutes;
     }
 
-    // ---- 音效系统（程序化正弦波占位音效，不依赖外部文件）----
-    // 缓冲区必须在 sf::Sound 之前声明，且生命周期不短于对应 Sound 对象
-    sf::SoundBuffer smileBuffer = makeSineBuffer(660.f, 0.15f); // 微笑：E5，短促轻快
-    sf::SoundBuffer laughBuffer = makeSineBuffer(880.f, 0.30f); // 大笑：A5，稍长活泼
-    sf::Sound smileSound(smileBuffer);
-    sf::Sound laughSound(laughBuffer);
-    smileSound.setVolume(70.f);
-    laughSound.setVolume(70.f);
+    // ---- 音效系统：sf::Music 流式播放 MP3，加载失败回退正弦波 SoundBuffer ----
+    // Music 走独立解码路径，对 MP3 兼容性优于 SoundBuffer::loadFromFile
+    sf::Music smileMusic, laughMusic;
+    bool smileMusicOk = smileMusic.openFromFile("assets/sounds/smile.mp3");
+    bool laughMusicOk = laughMusic.openFromFile("assets/sounds/laugh.mp3");
+    smileMusic.setLooping(false);
+    laughMusic.setLooping(false);
+
+    // 回退用 SoundBuffer（仅 Music 加载失败时启用）
+    // 缓冲区须在 Sound 之前声明，生命周期不短于 Sound 对象
+    sf::SoundBuffer smileFallBuf, laughFallBuf;
+    if (!smileMusicOk) smileFallBuf = makeSineBuffer(660.f, 0.15f);
+    if (!laughMusicOk) laughFallBuf = makeSineBuffer(880.f, 0.30f);
+    sf::Sound smileFallSound(smileFallBuf), laughFallSound(laughFallBuf);
+    smileFallSound.setVolume(70.f);
+    laughFallSound.setVolume(70.f);
+
+    // 统一播放接口：优先 Music，降级 SoundBuffer；stop() 防止重叠播放
+    auto playSmile = [&] {
+        if (smileMusicOk) { smileMusic.stop(); smileMusic.play(); }
+        else smileFallSound.play();
+    };
+    auto playLaugh = [&] {
+        if (laughMusicOk) { laughMusic.stop(); laughMusic.play(); }
+        else laughFallSound.play();
+    };
     bool isMuted       = false; // 静音标志，默认开启；右键菜单切换
     bool isPinned      = false; // 固定标志：true 时禁止拖动和甩动
     bool laughDisabled = false; // 禁用点击动画：true 时点击不触发 Smile/Laugh
@@ -514,6 +702,10 @@ int main()
     std::deque<TP> clicks;          // 记录最近点击的时间戳，用于检测快速连击
     constexpr int  LAUGH_N  = 5;    // 触发大笑所需的连击次数
     constexpr int  RAPID_MS = 1500; // 连击有效时间窗口（1.5秒内的点击才算连击）
+
+    // laugh 音效延迟播放：进入大笑状态后等 0.3 秒再播放，避免音画不同步
+    bool laughSoundPending = false; // 是否有待播放的 laugh 音效
+    TP   laughSoundAt      = {};    // 预定播放的时间点
 
     // ---- 鼠标拖动相关变量 ----
     bool         dragging = false;  // 鼠标左键是否正在按住
@@ -579,8 +771,13 @@ int main()
     // ============================================================
     // 主循环：事件处理 → 状态更新 → 渲染，每帧执行一次
     // ============================================================
+    TP prevFrameTime = Clock::now(); // 上一帧时间点，用于计算 deltaTime
     while (window.isOpen()) {
-        TP now = Clock::now(); // 记录本帧开始时间，供本帧所有逻辑统一使用
+        TP  now = Clock::now(); // 记录本帧开始时间，供本帧所有逻辑统一使用
+        // 帧时间差，最大限制 100ms，防止调试暂停后动画跳帧
+        float dt = std::min(
+            std::chrono::duration_cast<Fsec>(now - prevFrameTime).count(), 0.1f);
+        prevFrameTime = now;
 
         // ---- 托盘消息处理 ----
         // 用 PeekMessage + DispatchMessage 驱动独立消息窗口（trayWnd）的消息队列，
@@ -624,18 +821,27 @@ int main()
 
         greet.update(now); // 更新气泡：检查超时，IP 查询完成后刷新最后一行
 
-        // 连续使用时长超过60分钟则永久进入疲惫状态（只设不清）
-        if (!tired) {
+        // forceNormal 到期检查：30秒后自动恢复正常状态机逻辑
+        if (forceNormal && now >= forceNormalUntil)
+            forceNormal = false;
+
+        // forceNormal 期间跳过疲惫检测，避免计时被"偷走"
+        if (!tired && !forceNormal) {
             auto usedMs = std::chrono::duration_cast<Ms>(now - startTime).count();
             if (usedMs >= 60LL * 60 * 1000)
                 tired = true;
         }
 
+        // 记录本帧 isBusy() 结果：既用于上升沿检测，也用于 baseState 计算
+        // forceNormal 期间将 curBusy 视为 false，阻止 Cry/PreCry 触发
+        bool curBusy = !forceNormal && sysmon.isBusy();
+
         // 计算本帧的"基础状态"：飞行/拖动/点击等高优先级状态结束后的默认回落目标
-        // 优先级：疲惫 > CPU/内存过载（哭泣）> 正常
-        State baseState = tired            ? State::Tired :
-                          sysmon.isBusy()  ? State::Cry   :
-                                             State::Normal;
+        // 优先级：疲惫 > PreCry > CPU/内存过载（哭泣）> 正常
+        // forceNormal 期间忽略 tired 和 curBusy，强制回落到 Normal
+        State baseState = (!forceNormal && tired) ? State::Tired :
+                          curBusy                 ? State::Cry   :
+                                                    State::Normal;
 
         // ---- 事件处理 ----
         while (auto ev = window.pollEvent()) {
@@ -779,17 +985,25 @@ int main()
                             else                break;
                         }
 
-                        // 连击5次 → 触发大笑状态，持续2秒
+                        // 连击5次 → 触发大笑状态，持续 68帧×(1/12s)≈5667ms，与动画时长严格对齐
                         if (static_cast<int>(clicks.size()) >= LAUGH_N) {
                             state    = State::Laugh;
-                            stateEnd = now + Ms(2000);
+                            stateEnd = now + Ms(5667);
+                            laughAnim.reset(); // 从第一帧开始播
                             clicks.clear(); // 清空计数，下一轮重新累计
-                            if (!isMuted) laughSound.play();
+                            // 延迟 0.3 秒播放音效，登记时间点，由主循环统一检测触发
+                            if (!isMuted) {
+                                laughSoundPending = true;
+                                laughSoundAt      = now + Ms(300);
+                            }
                         } else {
-                            // 普通点击 → 触发微笑状态，持续1秒
+                            // 普通点击 → 触发微笑状态，持续 9帧×(1/12s)=750ms，与动画时长严格对齐
                             state    = State::Smile;
-                            stateEnd = now + Ms(1000);
-                            if (!isMuted) smileSound.play();
+                            stateEnd = now + Ms(750);
+                            smileAnim.reset(); // 从第一帧开始播，避免接力残留帧
+                            // 清除残留的挤压动画，防止 squish scale 叠加到 smile 渲染上
+                            phys.squish = {};
+                            if (!isMuted) playSmile();
                         }
                     }
 
@@ -869,12 +1083,14 @@ int main()
                     case 4: laughDisabled = !laughDisabled; break;
                     case 5: isMuted       = !isMuted;       break;
                     case 6: // 刷新至正常状态：重置所有临时状态，不影响开关类设置
-                        state      = State::Normal;
-                        stateEnd   = {};          // 清除 Smile/Laugh 计时
-                        tired      = false;       // 解除疲惫标志
-                        startTime  = now;         // 重置疲惫倒计时起点
-                        clicks.clear();           // 清空连击计数
-                        greet.active = false;     // 关闭打招呼气泡
+                        state             = State::Normal;
+                        stateEnd          = {};          // 清除 Smile/Laugh 计时
+                        tired             = false;       // 解除疲惫标志
+                        startTime         = now;         // 重置疲惫倒计时起点
+                        clicks.clear();                  // 清空连击计数
+                        greet.active      = false;       // 关闭打招呼气泡
+                        forceNormal       = true;        // 30秒内屏蔽疲惫/CPU/内存检测
+                        forceNormalUntil  = now + std::chrono::seconds(30);
                         break;
                     }
                 }
@@ -883,7 +1099,7 @@ int main()
 
         // ============================================================
         // 状态优先级判定（从高到低）：
-        //   飞行/弹跳 > 拖动 > 点击(微笑/大笑) > 疲惫 > 哭泣 > 正常
+        //   飞行/弹跳 > 拖动 > 点击(微笑/大笑) > 疲惫 > PreCry > 哭泣 > 正常
         // 各高优先级状态结束后统一回落到 baseState（由疲惫/CPU负载决定）
         // ============================================================
 
@@ -904,13 +1120,40 @@ int main()
 
         } else if (state == State::Smile || state == State::Laugh) {
             // 点击状态计时到期：回落到 baseState
-            if (now >= stateEnd)
+            if (now >= stateEnd) {
                 state = baseState;
+            }
+
+        } else if (state == State::PreCry) {
+            // PreCry 过渡状态：播放1秒后自动切换到 Cry
+            if (std::chrono::duration_cast<Ms>(now - preCryStart).count() >= 1000)
+                state = State::Cry;
 
         } else {
-            // 默认情况：始终跟随 baseState（疲惫/CPU负载实时更新）
-            state = baseState;
+            // 默认情况：始终跟随 baseState
+            // 检测 isBusy 上升沿（false → true）：非疲惫且非强制正常时才触发 PreCry
+            if (!prevBusy && curBusy && !tired && !forceNormal) {
+                state       = State::PreCry;
+                preCryStart = now;
+            } else {
+                state = baseState;
+            }
         }
+
+        // 记录本帧 isBusy 结果，供下一帧检测上升沿（刚超阈值那一刻）
+        prevBusy = curBusy;
+
+        // ---- laugh 音效延迟触发：到达预定时间点才播放 ----
+        if (laughSoundPending && now >= laughSoundAt) {
+            laughSoundPending = false;
+            playLaugh();
+        }
+
+        // ---- 更新帧动画（三套动画同时推进，各自帧率独立） ----
+        idleAnim .update(dt);
+        smileAnim.update(dt);
+        laughAnim.update(dt);
+        cryAnim  .update(dt);
 
         // ============================================================
         // 渲染：根据当前状态绘制对应形状和颜色
@@ -918,76 +1161,113 @@ int main()
         // ============================================================
         window.clear(sf::Color::Black);
 
+        // 每帧获取当前窗口尺寸（自适应素材分辨率）
+        auto  winSize = window.getSize();
+        float ww = static_cast<float>(winSize.x);
+        float wh = static_cast<float>(winSize.y);
+
         if (phys.active) {
-            // 飞行/弹跳状态：橙色圆形 + 挤压动画缩放
-            constexpr float r = 80.f;
-            sf::Vector2f scale = phys.squish.getScale(now); // 获取当前帧的挤压缩放系数
-            sf::CircleShape circle(r);
-            circle.setFillColor(sf::Color(255, 140, 0));    // 橙色，与正常状态一致
-            circle.setScale(scale);
-            // setScale 从左上角缩放，需要根据实际缩放量重新计算居中位置
-            circle.setPosition({150.f - r * scale.x, 150.f - r * scale.y});
-            window.draw(circle);
+            // 飞行/弹跳状态：idle 动画 + 挤压缩放；无素材时回退橙色圆形
+            sf::Vector2f squishScale = phys.squish.getScale(now);
+            if (idleAnim.loaded) {
+                window.draw(idleAnim.getCurrentSprite(winSize, squishScale));
+            } else {
+                constexpr float r = 80.f;
+                sf::CircleShape circle(r);
+                circle.setFillColor(sf::Color(255, 140, 0));
+                circle.setScale(squishScale);
+                circle.setPosition({ww / 2.f - r * squishScale.x,
+                                    wh / 2.f - r * squishScale.y});
+                window.draw(circle);
+            }
 
         } else if (state == State::Drag) {
-            // 拖动状态：紫色横向椭圆（通过对圆形施加不等比缩放实现）
-            constexpr float rx = 105.f, ry = 58.f; // 横向半径大于纵向，形成扁圆
-            sf::CircleShape ellipse(rx);
-            ellipse.setScale({1.f, ry / rx});               // Y 轴压缩为 rx 的 ry/rx 倍
-            ellipse.setFillColor(sf::Color(150, 50, 220));  // 紫色
-            ellipse.setPosition({150.f - rx, 150.f - ry}); // 居中
-            window.draw(ellipse);
+            // 拖动状态：播放 idle 动画（与静止外观一致，体现被抓起但未甩动）
+            if (idleAnim.loaded)
+                window.draw(idleAnim.getCurrentSprite(winSize));
 
-        } else if (state == State::Tired) {
-            // 疲惫状态：灰色圆形（略微缩小）+ 右上方"Take a break!"文字气泡
-            constexpr float r = 65.f;
-            sf::CircleShape circle(r);
-            circle.setFillColor(sf::Color(160, 160, 160));  // 灰色
-            circle.setPosition({150.f - r, 150.f - r});     // 居中
-            window.draw(circle);
+        } else if (state == State::Smile) {
+            // 微笑状态：smile 动画；无素材时回退黄色圆形
+            if (smileAnim.loaded) {
+                window.draw(smileAnim.getCurrentSprite(winSize));
+            } else {              
+                constexpr float r = 90.f;
+                sf::CircleShape circle(r);
+                circle.setFillColor(sf::Color(255, 220, 0));
+                circle.setPosition({ww / 2.f - r, wh / 2.f - r});
+                window.draw(circle);
+            }
 
-            // 气泡背景：白色矩形 + 灰色边框，位于奶龙右上方
-            sf::RectangleShape bubble({130.f, 38.f});
-            bubble.setFillColor(sf::Color(255, 255, 255));
-            bubble.setOutlineColor(sf::Color(140, 140, 140));
-            bubble.setOutlineThickness(2.f);
-            bubble.setPosition({155.f, 8.f});
-            window.draw(bubble);
+        } else if (state == State::Laugh) {
+            // 大笑状态：laugh 动画；无素材时回退红色圆形
+            if (laughAnim.loaded) {
+                window.draw(laughAnim.getCurrentSprite(winSize));
+            } else {
+                constexpr float r = 110.f;
+                sf::CircleShape circle(r);
+                circle.setFillColor(sf::Color(220, 50, 50));
+                circle.setPosition({ww / 2.f - r, wh / 2.f - r});
+                window.draw(circle);
+            }
 
-            // 气泡文字（仅在字体加载成功时绘制，自动居中于气泡）
-            if (fontLoaded) {
-                sf::Text text(bubbleFont, "Take a break!", 14);
-                text.setFillColor(sf::Color(70, 70, 70)); // 深灰色
-                auto b = text.getLocalBounds();
-                text.setOrigin({b.position.x + b.size.x / 2.f,
-                                b.position.y + b.size.y / 2.f});
-                text.setPosition({155.f + 65.f, 8.f + 19.f}); // 气泡中心
-                window.draw(text);
+        } else if (state == State::Cry) {
+            // 哭泣状态：cry 动画循环播放；无素材时回退蓝色圆形
+            if (cryAnim.loaded) {
+                window.draw(cryAnim.getCurrentSprite(winSize));
+            } else {
+                constexpr float r = 60.f;
+                sf::CircleShape circle(r);
+                circle.setFillColor(sf::Color(50, 100, 255));
+                circle.setPosition({ww / 2.f - r, wh / 2.f - r});
+                window.draw(circle);
             }
 
         } else {
-            // 普通状态：根据 state 枚举决定颜色和大小
-            float     r = 80.f;
-            sf::Color c = sf::Color(255, 140, 0);
-            switch (state) {
-            case State::Normal: r =  80.f; c = sf::Color(255, 140,   0); break; // 橙色，基准大小
-            case State::Smile:  r =  90.f; c = sf::Color(255, 220,   0); break; // 黄色，略微变大
-            case State::Laugh:  r = 110.f; c = sf::Color(220,  50,  50); break; // 红色，明显变大
-            case State::Cry:    r =  60.f; c = sf::Color( 50, 100, 255); break; // 蓝色，缩小
-            default:                                                       break;
+            // Normal / PreCry / Tired：统一播放 idle 动画；无素材时按状态回退色块
+            if (idleAnim.loaded) {
+                window.draw(idleAnim.getCurrentSprite(winSize));
+            } else {
+                float r = 80.f;
+                sf::Color c = sf::Color(255, 140, 0);
+                if (state == State::Tired) { r = 65.f; c = sf::Color(160, 160, 160); }
+                sf::CircleShape circle(r);
+                circle.setFillColor(c);
+                circle.setPosition({ww / 2.f - r, wh / 2.f - r});
+                window.draw(circle);
             }
-            sf::CircleShape circle(r);
-            circle.setFillColor(c);
-            circle.setPosition({150.f - r, 150.f - r}); // 始终居中于 300×300 窗口
-            window.draw(circle);
+
+            // 疲惫状态：在动画上叠加"Take a break!"气泡
+            if (state == State::Tired) {
+                constexpr float bubbleW = 130.f, bubbleH = 38.f;
+                // 气泡底边对齐到奶龙身体顶部上方 10px
+                float bx = ww / 2.f + 10.f;
+                float by = static_cast<float>(phys.bodyOffT) - 10.f - bubbleH;
+                sf::RectangleShape bubble({bubbleW, bubbleH});
+                bubble.setFillColor(sf::Color(255, 255, 255));
+                bubble.setOutlineColor(sf::Color(140, 140, 140));
+                bubble.setOutlineThickness(2.f);
+                bubble.setPosition({bx, by});
+                window.draw(bubble);
+                if (fontLoaded) {
+                    sf::Text text(bubbleFont, "Take a break!", 14);
+                    text.setFillColor(sf::Color(70, 70, 70));
+                    auto b = text.getLocalBounds();
+                    text.setOrigin({b.position.x + b.size.x / 2.f,
+                                    b.position.y + b.size.y / 2.f});
+                    text.setPosition({bx + 65.f, by + 19.f});
+                    window.draw(text);
+                }
+            }
         }
 
         // 打招呼气泡：最后绘制，叠加在宠物形象上方，20秒后自动消失
         if (greet.active && fontLoaded) {
-            // 气泡尺寸：宽占满窗口，高按行数动态计算
-            constexpr float bx = 5.f, by = 3.f, bw = 290.f;
+            constexpr float bx   = 5.f;
+            float bw = std::max(200.f, ww - 10.f);
             constexpr float lineH = 22.f; // 行间距，与字号 15 匹配
             float bh = 10.f + static_cast<float>(greet.lines.size()) * lineH;
+            // 气泡底边对齐到奶龙身体顶部上方 10px
+            float by = static_cast<float>(phys.bodyOffT) - 10.f - bh;
 
             sf::RectangleShape bg({bw, bh});
             bg.setFillColor(sf::Color(255, 255, 255));

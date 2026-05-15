@@ -1,0 +1,3 @@
+idle  canvas:414x603  char:278x553  scale=(0.6000,0.6000)  ->charRendered 166.8x331.8 px
+smile  canvas:518x718  char:331x659  scale=(0.5039,0.5035)  ->charRendered 166.8x331.8 px
+laugh  canvas:373x668  char:284x571  scale=(0.5873,0.5811)  ->charRendered 166.8x331.8 px
